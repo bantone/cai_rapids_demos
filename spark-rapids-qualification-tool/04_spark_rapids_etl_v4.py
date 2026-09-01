@@ -38,18 +38,16 @@
 #***************************************************************************/
 
 #****************************************************************************
-# Spark RAPIDS Benchmark - ETL v3
+# Spark RAPIDS Benchmark - ETL v4 (GPU)
 #
-# Workload:
-#   - Large fact table scan
-#   - Multiple dimension joins
-#   - Multi-stage aggregations
-#   - Customer behavioral metrics
-#   - Merchant analytics
-#   - Rejoins
-#   - Heavy expressions
-#   - Final aggregation
+# Extends v3 with operations chosen to widen the CPU/GPU gap:
+#   - regexp_extract   (string parsing at scale)
+#   - array + explode  (per-row tag fan-out)
+#   - approx_count_distinct (high-cardinality distinct counts)
+#   - window function   (ordered cumulative aggregate)
 #
+# run()/save() must stay identical to 02_etl_v4.py (CPU) so the two
+# runs are comparable -- only createSparkConnection() differs.
 #****************************************************************************
 
 
@@ -64,7 +62,7 @@ import cml.data_v1 as cmldata
 
 
 
-class BankingETLv3:
+class BankingETLv4:
 
 
     def __init__(
@@ -85,61 +83,153 @@ class BankingETLv3:
     ############################################################
 
     def createSparkConnection(self):
-      
-        os.makedirs(
-        "/home/cdsw/spark-rapids-qualification-tool/spark-event-logs-dir",
-        exist_ok=True
-        )
 
+        # -----------------------------------------------------------------
+        # NOTE: Update this path to match where the RAPIDS jar actually
+        # resolves to on disk. Find it with:
+        #   find / -name "rapids-4-spark*26.02.0*.jar" 2>/dev/null
+        # -----------------------------------------------------------------
+        RAPIDS_JAR_PATH = "/home/cdsw/.ivy2/jars/com.nvidia_rapids-4-spark_2.12-26.02.0.jar"
+
+        os.makedirs(
+            "/home/cdsw/spark-rapids-qualification-tool/spark-event-logs-dir",
+            exist_ok=True
+        )
 
         spark = (
 
             SparkSession.builder
 
-            .appName(
-                "Spark-ETL-v3"
+            .appName("Spark-Rapids-ETL-v4")
+
+            # ------------------------------------------------------------------
+            # Resources
+            # ------------------------------------------------------------------
+            .config("spark.dynamicAllocation.enabled", "false")
+            .config("spark.executor.instances", "12")
+            .config("spark.executor.cores", "4")
+            .config("spark.executor.memory", "16g")
+            .config("spark.executor.memoryOverhead", "3g")
+            .config("spark.driver.memory", "10g")
+
+            # ------------------------------------------------------------------
+            # GPU Configuration
+            # ------------------------------------------------------------------
+            .config("spark.executor.resource.gpu.amount", "1")
+            .config("spark.task.resource.gpu.amount", 0.250)
+            .config(
+                "spark.executor.resource.gpu.discoveryScript",
+                "/home/cdsw/getGpusResources.sh"
+            )
+            .config(
+                "spark.executor.resource.gpu.vendor",
+                "nvidia.com"
+            )
+            .config(
+                "spark.shuffle.manager",
+                "com.nvidia.spark.rapids.spark351.RapidsShuffleManager"
+            )
+
+            # ------------------------------------------------------------------
+            # Explicit RAPIDS jar classpath (fixes ClassNotFoundException on
+            # RapidsShuffleManager -- spark.jars.packages alone does not
+            # reliably reach the executor classpath in time for shuffle
+            # manager initialization)
+            # ------------------------------------------------------------------
+            .config(
+                "spark.driver.extraClassPath",
+                RAPIDS_JAR_PATH
+            )
+            .config(
+                "spark.executor.extraClassPath",
+                RAPIDS_JAR_PATH
+            )
+
+            # ------------------------------------------------------------------
+            # Spark RAPIDS
+            # ------------------------------------------------------------------
+            .config(
+                "spark.plugins",
+                "com.nvidia.spark.SQLPlugin"
+            )
+            .config(
+                "spark.jars.packages",
+#                "com.nvidia:rapids-4-spark_2.12:25.08.0"
+                "com.nvidia:rapids-4-spark_2.12:26.02.0"
+            )
+          .config(
+              "spark.rapids.shims-provider-override",
+              "com.nvidia.spark.rapids.shims.spark351.SparkShimServiceProvider",
+            )
+            .config(
+                "spark.kryo.registrator",
+                "com.nvidia.spark.rapids.GpuKryoRegistrator"
             )
 
             .config(
-                "spark.driver.cores",
-                4
-            )
-
-            .config(
-                "spark.driver.memory",
-                "4g"
-            )
-
-            .config(
-                "spark.dynamicAllocation.enabled",
-                "false"
-            )
-
-            .config(
-                "spark.executor.instances",
-                12
-            )
-
-            .config(
-                "spark.executor.cores",
-                4
-            )
-
-            .config(
-                "spark.executor.memory",
-                "16g"
-            )
-
-            .config(
-                "spark.sql.shuffle.partitions",
-                800
-            )
-
-            .config(
-                "spark.sql.adaptive.enabled",
+                "spark.rapids.sql.enabled",
                 "true"
             )
 
+            .config(
+                "spark.rapids.sql.incompatibleOps.enabled",
+                "true"
+            )
+
+            .config(
+                "spark.rapids.sql.udfCompiler.enabled",
+                "true"
+            )
+
+            .config(
+                "spark.rapids.sql.concurrentGpuTasks",
+                "2"
+            )
+
+            .config(
+                "spark.rapids.memory.pinnedPool.size",
+                "2g"
+            )
+
+            .config(
+                "spark.rapids.sql.explain",
+                "ALL"
+            )
+
+            .config(
+                "spark.rapids.sql.variableFloatAgg.enabled",
+                "true"
+            )
+
+            .config(
+                "spark.rapids.sql.castFloatToString.enabled",
+                "true"
+            )
+
+            .config(
+                "spark.rapids.sql.castStringToFloat.enabled",
+                "true"
+            )
+
+            .config(
+                "spark.rapids.sql.csv.read.float.enabled",
+                "true"
+            )
+
+            .config(
+                "spark.rapids.sql.format.csv.enabled",
+                "true"
+            )
+
+            .config(
+                "spark.rapids.sql.format.csv.read.enabled",
+                "true"
+            )
+
+            # ------------------------------------------------------------------
+            # Spark Optimizations
+            # ------------------------------------------------------------------
+            .config("spark.sql.adaptive.enabled", "true")
             .config(
                 "spark.sql.adaptive.advisoryPartitionSizeInBytes",
                 "1g"
@@ -151,31 +241,41 @@ class BankingETLv3:
             )
 
             .config(
+                "spark.locality.wait",
+                "0"
+            )
+
+            .config(
+                "spark.sql.shuffle.partitions",
+                "800"
+            )
+
+            .config(
+                "spark.eventLog.enabled",
+                "true"
+            )
+
+            .config(
+                "spark.eventLog.dir",
+                "file:///home/cdsw/spark-rapids-qualification-tool/spark-event-logs-dir"
+            )
+
+            # ------------------------------------------------------------------
+            # Storage
+            # ------------------------------------------------------------------
+            .config(
                 "spark.kerberos.access.hadoopFileSystems",
                 self.storage
             )
 
-            .config(
-            "spark.eventLog.dir",
-            "file:///home/cdsw/spark-rapids-qualification-tool/spark-event-logs-dir"
-            )
-          
             .getOrCreate()
 
         )
-
 
         spark.conf.set(
             "spark.sql.autoBroadcastJoinThreshold",
             -1
         )
-
-
-        spark.conf.set(
-            "spark.sql.shuffle.partitions",
-            800
-        )
-
 
         return spark
 
@@ -302,6 +402,8 @@ class BankingETLv3:
 
                 F.col("c.risk_rating"),
 
+                F.col("c.city"),
+
 
                 F.col("a.account_type"),
 
@@ -412,9 +514,75 @@ class BankingETLv3:
         )
 
 
-        # Cached because `base` is read three more times below
-        # (both aggregation layers plus the rejoin) — without this,
-        # Spark redoes the full 5-way join for each read.
+
+        ########################################################
+        # GPU-favorable operations (v4 additions)
+        #   - regexp_extract on a string column at row scale
+        #   - array + array_compact building a per-row tag list
+        #   - window function producing an ordered running total
+        ########################################################
+
+
+        base = (
+
+            base
+
+            .withColumn(
+                "city_zone",
+                F.regexp_extract(
+                    F.col("city"),
+                    r"CITY_(\d+)",
+                    1
+                )
+                .cast("int")
+            )
+
+            .withColumn(
+                "risk_tags",
+                F.array_compact(
+                    F.array(
+                        F.when(
+                            F.col("transaction_bucket") == "HIGH",
+                            F.lit("HIGH_VALUE")
+                        ),
+                        F.when(
+                            F.col("fraud_flag") == 1,
+                            F.lit("FRAUD_FLAGGED")
+                        ),
+                        F.when(
+                            F.col("risk_rating") == "HIGH",
+                            F.lit("HIGH_RISK_CUSTOMER")
+                        )
+                    )
+                )
+            )
+
+        )
+
+
+        customer_spend_window = (
+
+            Window
+            .partitionBy("customer_id")
+            .orderBy("transaction_date")
+            .rowsBetween(
+                Window.unboundedPreceding,
+                Window.currentRow
+            )
+
+        )
+
+
+        base = base.withColumn(
+            "customer_cumulative_spend",
+            F.sum("transaction_amount").over(customer_spend_window)
+        )
+
+
+        # Cached because `base` is read four more times below
+        # (both aggregation layers, the rejoin, and the tag
+        # fan-out) — without this, Spark redoes the full 5-way
+        # join plus the window/regex pass for each read.
         base = base.cache()
 
 
@@ -476,6 +644,14 @@ class BankingETLv3:
                 )
                 .alias(
                     "customer_fraud_count"
+                ),
+
+
+                F.approx_count_distinct(
+                    "merchant_id"
+                )
+                .alias(
+                    "customer_distinct_merchants"
                 )
 
             )
@@ -525,6 +701,59 @@ class BankingETLv3:
                 )
                 .alias(
                     "merchant_avg_transaction"
+                ),
+
+
+                F.approx_count_distinct(
+                    "customer_id"
+                )
+                .alias(
+                    "merchant_distinct_customers"
+                )
+
+            )
+
+        )
+
+
+
+        ########################################################
+        # Tag fan-out (explode)
+        ########################################################
+
+
+        tag_metrics = (
+
+            base
+
+            .select(
+                "risk_tags",
+                "customer_id",
+                "transaction_amount"
+            )
+
+            .withColumn(
+                "risk_tag",
+                F.explode("risk_tags")
+            )
+
+            .groupBy("risk_tag")
+
+            .agg(
+
+                F.count("*")
+                .alias(
+                    "tag_transaction_count"
+                ),
+
+                F.sum("transaction_amount")
+                .alias(
+                    "tag_total_amount"
+                ),
+
+                F.approx_count_distinct("customer_id")
+                .alias(
+                    "tag_distinct_customers"
                 )
 
             )
@@ -650,6 +879,22 @@ class BankingETLv3:
                 )
                 .alias(
                     "fraud_events"
+                ),
+
+
+                F.avg(
+                    "customer_cumulative_spend"
+                )
+                .alias(
+                    "avg_customer_cumulative_spend"
+                ),
+
+
+                F.approx_count_distinct(
+                    "customer_id"
+                )
+                .alias(
+                    "distinct_customers"
                 )
 
             )
@@ -672,18 +917,19 @@ class BankingETLv3:
         )
 
 
-        return result
+        return result, tag_metrics
 
 
 
     ############################################################
 
-    def save(self, df):
+    def save(self, df, tag_df):
 
 
-        # Cached so the row count below reads from cache instead of
-        # re-running the entire plan a second time.
+        # Cached so the row counts below read from cache instead
+        # of re-running the entire plan a second time.
         df = df.cache()
+        tag_df = tag_df.cache()
 
 
         df.write.mode(
@@ -692,18 +938,34 @@ class BankingETLv3:
 
         ).saveAsTable(
 
-            f"{self.database}.ETL_V3_RESULT"
+            f"{self.database}.ETL_V4_RESULT"
+
+        )
+
+
+        tag_df.write.mode(
+
+            "overwrite"
+
+        ).saveAsTable(
+
+            f"{self.database}.ETL_V4_RISK_TAGS"
 
         )
 
 
         print(
-            "ETL v3 complete"
+            "ETL v4 complete"
         )
 
 
         print(
             f"Output rows: {df.count():,}"
+        )
+
+
+        print(
+            f"Risk tag rows: {tag_df.count():,}"
         )
 
 
@@ -732,7 +994,7 @@ def main():
 
 
 
-    job = BankingETLv3(
+    job = BankingETLv4(
 
         CONNECTION_NAME,
 
@@ -749,13 +1011,14 @@ def main():
     spark = job.createSparkConnection()
 
 
-    output = job.run(
+    result, tag_metrics = job.run(
         spark
     )
 
 
     job.save(
-        output
+        result,
+        tag_metrics
     )
 
 

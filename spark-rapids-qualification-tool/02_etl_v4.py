@@ -38,18 +38,18 @@
 #***************************************************************************/
 
 #****************************************************************************
-# Spark RAPIDS Benchmark - ETL v3
+# Spark RAPIDS Benchmark - ETL v4
 #
-# Workload:
-#   - Large fact table scan
-#   - Multiple dimension joins
-#   - Multi-stage aggregations
-#   - Customer behavioral metrics
-#   - Merchant analytics
-#   - Rejoins
-#   - Heavy expressions
-#   - Final aggregation
+# Extends v3 with operations chosen to widen the CPU/GPU gap:
+#   - regexp_extract   (string parsing at scale)
+#   - array + explode  (per-row tag fan-out)
+#   - approx_count_distinct (high-cardinality distinct counts)
+#   - window function   (ordered cumulative aggregate)
 #
+# Everything from v3 (5-way join, two aggregation layers, rejoin,
+# final aggregation + sort) is unchanged so the two runs stay
+# comparable; the block below is inserted right after the v3
+# "heavy expressions" step.
 #****************************************************************************
 
 
@@ -64,7 +64,7 @@ import cml.data_v1 as cmldata
 
 
 
-class BankingETLv3:
+class BankingETLv4:
 
 
     def __init__(
@@ -85,10 +85,10 @@ class BankingETLv3:
     ############################################################
 
     def createSparkConnection(self):
-      
+
         os.makedirs(
-        "/home/cdsw/spark-rapids-qualification-tool/spark-event-logs-dir",
-        exist_ok=True
+            "/home/cdsw/spark-rapids-qualification-tool/spark-event-logs-dir",
+            exist_ok=True
         )
 
 
@@ -97,7 +97,7 @@ class BankingETLv3:
             SparkSession.builder
 
             .appName(
-                "Spark-ETL-v3"
+                "Spark-ETL-v4"
             )
 
             .config(
@@ -156,10 +156,10 @@ class BankingETLv3:
             )
 
             .config(
-            "spark.eventLog.dir",
-            "file:///home/cdsw/spark-rapids-qualification-tool/spark-event-logs-dir"
+                "spark.eventLog.dir",
+                "file:///home/cdsw/spark-rapids-qualification-tool/spark-event-logs-dir"
             )
-          
+
             .getOrCreate()
 
         )
@@ -302,6 +302,8 @@ class BankingETLv3:
 
                 F.col("c.risk_rating"),
 
+                F.col("c.city"),
+
 
                 F.col("a.account_type"),
 
@@ -412,9 +414,75 @@ class BankingETLv3:
         )
 
 
-        # Cached because `base` is read three more times below
-        # (both aggregation layers plus the rejoin) — without this,
-        # Spark redoes the full 5-way join for each read.
+
+        ########################################################
+        # GPU-favorable operations (v4 additions)
+        #   - regexp_extract on a string column at row scale
+        #   - array + array_compact building a per-row tag list
+        #   - window function producing an ordered running total
+        ########################################################
+
+
+        base = (
+
+            base
+
+            .withColumn(
+                "city_zone",
+                F.regexp_extract(
+                    F.col("city"),
+                    r"CITY_(\d+)",
+                    1
+                )
+                .cast("int")
+            )
+
+            .withColumn(
+                "risk_tags",
+                F.array_compact(
+                    F.array(
+                        F.when(
+                            F.col("transaction_bucket") == "HIGH",
+                            F.lit("HIGH_VALUE")
+                        ),
+                        F.when(
+                            F.col("fraud_flag") == 1,
+                            F.lit("FRAUD_FLAGGED")
+                        ),
+                        F.when(
+                            F.col("risk_rating") == "HIGH",
+                            F.lit("HIGH_RISK_CUSTOMER")
+                        )
+                    )
+                )
+            )
+
+        )
+
+
+        customer_spend_window = (
+
+            Window
+            .partitionBy("customer_id")
+            .orderBy("transaction_date")
+            .rowsBetween(
+                Window.unboundedPreceding,
+                Window.currentRow
+            )
+
+        )
+
+
+        base = base.withColumn(
+            "customer_cumulative_spend",
+            F.sum("transaction_amount").over(customer_spend_window)
+        )
+
+
+        # Cached because `base` is read four more times below
+        # (both aggregation layers, the rejoin, and the tag
+        # fan-out) — without this, Spark redoes the full 5-way
+        # join plus the window/regex pass for each read.
         base = base.cache()
 
 
@@ -476,6 +544,14 @@ class BankingETLv3:
                 )
                 .alias(
                     "customer_fraud_count"
+                ),
+
+
+                F.approx_count_distinct(
+                    "merchant_id"
+                )
+                .alias(
+                    "customer_distinct_merchants"
                 )
 
             )
@@ -525,6 +601,59 @@ class BankingETLv3:
                 )
                 .alias(
                     "merchant_avg_transaction"
+                ),
+
+
+                F.approx_count_distinct(
+                    "customer_id"
+                )
+                .alias(
+                    "merchant_distinct_customers"
+                )
+
+            )
+
+        )
+
+
+
+        ########################################################
+        # Tag fan-out (explode)
+        ########################################################
+
+
+        tag_metrics = (
+
+            base
+
+            .select(
+                "risk_tags",
+                "customer_id",
+                "transaction_amount"
+            )
+
+            .withColumn(
+                "risk_tag",
+                F.explode("risk_tags")
+            )
+
+            .groupBy("risk_tag")
+
+            .agg(
+
+                F.count("*")
+                .alias(
+                    "tag_transaction_count"
+                ),
+
+                F.sum("transaction_amount")
+                .alias(
+                    "tag_total_amount"
+                ),
+
+                F.approx_count_distinct("customer_id")
+                .alias(
+                    "tag_distinct_customers"
                 )
 
             )
@@ -650,6 +779,22 @@ class BankingETLv3:
                 )
                 .alias(
                     "fraud_events"
+                ),
+
+
+                F.avg(
+                    "customer_cumulative_spend"
+                )
+                .alias(
+                    "avg_customer_cumulative_spend"
+                ),
+
+
+                F.approx_count_distinct(
+                    "customer_id"
+                )
+                .alias(
+                    "distinct_customers"
                 )
 
             )
@@ -672,18 +817,19 @@ class BankingETLv3:
         )
 
 
-        return result
+        return result, tag_metrics
 
 
 
     ############################################################
 
-    def save(self, df):
+    def save(self, df, tag_df):
 
 
-        # Cached so the row count below reads from cache instead of
-        # re-running the entire plan a second time.
+        # Cached so the row counts below read from cache instead
+        # of re-running the entire plan a second time.
         df = df.cache()
+        tag_df = tag_df.cache()
 
 
         df.write.mode(
@@ -692,18 +838,34 @@ class BankingETLv3:
 
         ).saveAsTable(
 
-            f"{self.database}.ETL_V3_RESULT"
+            f"{self.database}.ETL_V4_RESULT"
+
+        )
+
+
+        tag_df.write.mode(
+
+            "overwrite"
+
+        ).saveAsTable(
+
+            f"{self.database}.ETL_V4_RISK_TAGS"
 
         )
 
 
         print(
-            "ETL v3 complete"
+            "ETL v4 complete"
         )
 
 
         print(
             f"Output rows: {df.count():,}"
+        )
+
+
+        print(
+            f"Risk tag rows: {tag_df.count():,}"
         )
 
 
@@ -732,7 +894,7 @@ def main():
 
 
 
-    job = BankingETLv3(
+    job = BankingETLv4(
 
         CONNECTION_NAME,
 
@@ -749,13 +911,14 @@ def main():
     spark = job.createSparkConnection()
 
 
-    output = job.run(
+    result, tag_metrics = job.run(
         spark
     )
 
 
     job.save(
-        output
+        result,
+        tag_metrics
     )
 
 
