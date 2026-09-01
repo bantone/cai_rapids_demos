@@ -112,7 +112,12 @@ class BankingETLv3:
 
             .config(
                 "spark.dynamicAllocation.enabled",
-                "true"
+                "false"
+            )
+
+            .config(
+                "spark.executor.instances",
+                12
             )
 
             .config(
@@ -128,6 +133,21 @@ class BankingETLv3:
             .config(
                 "spark.sql.shuffle.partitions",
                 800
+            )
+
+            .config(
+                "spark.sql.adaptive.enabled",
+                "true"
+            )
+
+            .config(
+                "spark.sql.adaptive.advisoryPartitionSizeInBytes",
+                "1g"
+            )
+
+            .config(
+                "spark.sql.files.maxPartitionBytes",
+                "256m"
             )
 
             .config(
@@ -392,6 +412,12 @@ class BankingETLv3:
         )
 
 
+        # Cached because `base` is read three more times below
+        # (both aggregation layers plus the rejoin) — without this,
+        # Spark redoes the full 5-way join for each read.
+        base = base.cache()
+
+
 
         ########################################################
         # Aggregation Layer 1
@@ -653,6 +679,11 @@ class BankingETLv3:
     ############################################################
 
     def save(self, df):
+
+
+        # Cached so the row count below reads from cache instead of
+        # re-running the entire plan a second time.
+        df = df.cache()
 
 
         df.write.mode(

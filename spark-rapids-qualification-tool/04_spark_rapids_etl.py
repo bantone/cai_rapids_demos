@@ -93,6 +93,11 @@ class BankingETLv3:
         # -----------------------------------------------------------------
         RAPIDS_JAR_PATH = "/home/cdsw/.ivy2/jars/com.nvidia_rapids-4-spark_2.12-26.02.0.jar"
 
+        os.makedirs(
+            "/home/cdsw/spark-rapids-qualification-tool/spark-event-logs-dir",
+            exist_ok=True
+        )
+
         spark = (
 
             SparkSession.builder
@@ -255,6 +260,11 @@ class BankingETLv3:
             .config(
                 "spark.eventLog.enabled",
                 "true"
+            )
+
+            .config(
+                "spark.eventLog.dir",
+                "file:///home/cdsw/spark-rapids-qualification-tool/spark-event-logs-dir"
             )
 
             # ------------------------------------------------------------------
@@ -529,6 +539,12 @@ class BankingETLv3:
         )
 
 
+        # Cached because `base` is read three more times below
+        # (both aggregation layers plus the rejoin) — without this,
+        # Spark redoes the full 5-way join for each read.
+        base = base.cache()
+
+
 
         ########################################################
         # Aggregation Layer 1
@@ -790,6 +806,11 @@ class BankingETLv3:
     ############################################################
 
     def save(self, df):
+
+
+        # Cached so the row count below reads from cache instead of
+        # re-running the entire plan a second time.
+        df = df.cache()
 
 
         df.write.mode(
