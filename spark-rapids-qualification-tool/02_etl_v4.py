@@ -156,6 +156,11 @@ class BankingETLv4:
             )
 
             .config(
+                "spark.eventLog.enabled",
+                "true"
+            )
+
+            .config(
                 "spark.eventLog.dir",
                 "file:///home/cdsw/spark-rapids-qualification-tool/spark-event-logs-dir"
             )

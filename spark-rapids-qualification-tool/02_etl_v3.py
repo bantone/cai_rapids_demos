@@ -85,7 +85,7 @@ class BankingETLv3:
     ############################################################
 
     def createSparkConnection(self):
-      
+
         os.makedirs(
         "/home/cdsw/spark-rapids-qualification-tool/spark-event-logs-dir",
         exist_ok=True
@@ -153,6 +153,11 @@ class BankingETLv3:
             .config(
                 "spark.kerberos.access.hadoopFileSystems",
                 self.storage
+            )
+
+            .config(
+                "spark.eventLog.enabled",
+                "true"
             )
 
             .config(
