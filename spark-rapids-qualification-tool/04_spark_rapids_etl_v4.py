@@ -40,7 +40,7 @@
 #****************************************************************************
 # Spark RAPIDS Benchmark - ETL v4 (GPU)
 #
-# Extends v3 with operations chosen to widen the CPU/GPU gap:
+# Extends v3 with additional operations:
 #   - regexp_extract   (string parsing at scale)
 #   - array + explode  (per-row tag fan-out)
 #   - approx_count_distinct (high-cardinality distinct counts)
@@ -286,6 +286,23 @@ class BankingETLv4:
     def run(self, spark):
 
 
+        ########################################################
+        # Workload
+        #   - Large fact table scan
+        #   - Multiple dimension joins
+        #   - Multi-stage aggregations
+        #   - Customer behavioral metrics
+        #   - Merchant analytics
+        #   - Rejoins
+        #   - Heavy expressions
+        #   - regexp_extract (string parsing)
+        #   - array + explode (tag fan-out)
+        #   - window function (cumulative spend)
+        #   - approx_count_distinct
+        #   - Final aggregation
+        ########################################################
+
+
         transactions = spark.table(
             f"{self.database}.TRX"
         )
@@ -516,7 +533,7 @@ class BankingETLv4:
 
 
         ########################################################
-        # GPU-favorable operations (v4 additions)
+        # Additional operations (v4)
         #   - regexp_extract on a string column at row scale
         #   - array + array_compact building a per-row tag list
         #   - window function producing an ordered running total
