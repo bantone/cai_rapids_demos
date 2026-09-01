@@ -27,10 +27,15 @@ import sys
 
 DEFAULT_EVENT_LOG_DIR = "/home/cdsw/spark-rapids-qualification-tool/spark-event-logs-dir"
 
-PROFILER_SCRIPT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..", "spark-log-profiler", "profile.py"
-)
+try:
+    # __file__ isn't defined when this code runs in a notebook cell
+    # (as opposed to `python3 05_compare_cpu_gpu.py` from a terminal) --
+    # fall back to this project's known layout under /home/cdsw.
+    _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _SCRIPT_DIR = "/home/cdsw/spark-rapids-qualification-tool"
+
+PROFILER_SCRIPT = os.path.join(_SCRIPT_DIR, "..", "spark-log-profiler", "profile.py")
 
 # Prefixes Spark uses for event log files/directories: v2 rolling
 # (eventlog_v2_spark-<appid>), legacy single-file (local-<ts>,
@@ -131,7 +136,11 @@ def main():
         action="store_true",
         help="list discovered event logs (newest first) and exit",
     )
-    args = ap.parse_args()
+    # parse_known_args instead of parse_args: a Jupyter/notebook kernel
+    # populates sys.argv with its own launcher args (e.g. -f
+    # <connection-file>), which parse_args would reject outright. Ignore
+    # anything we don't recognize instead of failing on it.
+    args, _unknown = ap.parse_known_args()
 
     logs = find_event_logs(args.dir)
     if not logs:
